@@ -1,5 +1,5 @@
 ## Introduce
-**Smart Speed Limiter** is a lightweight Python script that automatically detects and corrects overspeed issues in JSON‑formatted action sequences. It keeps the movement speed between any two consecutive actions within a safe threshold of **[color=#00ffcc]600 units/second[/color]** by intelligently redistributing time or compressing amplitudes, while preserving the overall shape and rhythm of the original trajectory as much as possible.
+**Smart Speed Limiter** is a lightweight Python script that automatically detects and corrects overspeed issues in JSON‑formatted action sequences. It keeps the movement speed between any two consecutive actions within a safe threshold of **600 units/second** by intelligently redistributing time or compressing amplitudes, while preserving the overall shape and rhythm of the original trajectory as much as possible.
 
 > *Written by DeepSeek.*
 

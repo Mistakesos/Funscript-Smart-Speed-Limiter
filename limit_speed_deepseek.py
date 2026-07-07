@@ -99,6 +99,23 @@ def process_continuous_block(actions, s, e):
             if red > best_red:
                 best_red = red
                 best_idx = idx
+        
+        # 检查删除 best_idx 后是否会导致剩余段首尾位置相同
+        after_del = sub[:best_idx] + sub[best_idx+1:]
+        if after_del[0]['pos'] == after_del[-1]['pos']:
+            # 首尾相同，无法通过删点获得有意义的运动，改为整体缩放位移
+            total_movement = sum(abs(sub[i+1]['pos'] - sub[i]['pos']) for i in range(n-1))
+            if total_movement > 0:
+                scale = (600 * total_duration / 1000.0) / total_movement
+                base = sub[0]['pos']
+                for i in range(1, n):
+                    delta = sub[i]['pos'] - base
+                    sub[i]['pos'] = base + int(round(delta * scale))
+                # 重新计算 min_deltas
+                min_deltas = [abs(sub[i+1]['pos'] - sub[i]['pos']) * 1000.0 / 600.0 for i in range(n-1)]
+            break  # 跳出删点循环
+        
+        # 安全删除
         del sub[best_idx]
         n -= 1
         min_deltas = [abs(sub[i+1]['pos'] - sub[i]['pos']) * 1000.0 / 600.0 for i in range(n-1)]

@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-
 """
 Smart Speed Limiter for Funscript — Signal Processing & Pattern Recognition
 ============================================================================
-Phase 1: Pre-process flat segments (preserve intentional holds)
-Phase 2: Global ACF-based periodicity detection & segmentation  
-Phase 3: Motif extraction from periodic blocks
-Phase 4: Whole-cycle deletion with uniform time-warping (phase-locked)
-Phase 5: Irregular block amplitude clamping (last-resort safety net)
+Phase 1: RLE compression → pattern discovery → global segmentation
+Phase 2: Motif extraction from original data points
+Phase 3: Whole-cycle deletion with uniform time-warping (phase-locked)
+Phase 4: Irregular block handling (flat segments & fallback amplitude limiter)
 
 Usage: python limit_speed_deepseek.py <input.funscript> <output.funscript>
 
@@ -21,20 +19,21 @@ import math
 from typing import List, Tuple, Optional, Dict, Any
 
 # =========================================================================
-#  CONFIGURATION — the ONLY magic number you should ever need to change
+#  CONFIGURATION
 # =========================================================================
-MAX_SPEED = 600
-DEBUG = True
+MAX_SPEED = 600          # maximum allowed speed (units/second) — the only
+
+DEBUG = True             # set to False to silence diagnostic output
 
 # -------------------------------------------------------------------------
-#  ACF / sliding‑window tuning knobs
+#  Derived / sanity limits (not magic — reasonable safety bounds)
 # -------------------------------------------------------------------------
-ACF_WINDOW_POINTS = 300
-ACF_STEP = 60
-ACF_PEAK_THRESHOLD = 0.55
-MIN_PERIOD_POINTS = 2
-MAX_PERIOD_POINTS = 200
+# Maximum pattern length to search for (in RLE states).
+# Dynamically capped at min(40, n//2) at runtime; 40 is an upper bound to
+# prevent O(n²) blowup on pathological inputs.
+MAX_PATTERN_LENGTH = 40
 
+# Platform detection threshold (ms) — purely diagnostic, not used in logic
 PLATFORM_WARN_MS = 500
 
 
@@ -58,451 +57,223 @@ def actions_to_arrays(actions: list):
 
 
 # =========================================================================
-#  STEP 1 — PRE-PROCESS: FLAT SEGMENT DETECTION
+#  STEP 1 — RLE COMPRESSION
 # =========================================================================
 
-def extract_flat_segments(times: List[int], positions: List[float],
-                          min_flat_duration_ms: int = 2000) -> List[dict]:
+def rle_encode(times: List[int], positions: List[float]) -> List[dict]:
     """
-    Identify contiguous ranges where position doesn't change for a
-    significant duration. These are intentional holds / pauses and should
-    be preserved as irregular blocks, not fed to the periodic processor.
-    Returns a list of block dicts (periodic=False) for each flat segment.
+    Run-length encode: merge consecutive points with identical position.
+    Returns list of dicts: {value, start_idx, end_idx, start_time}
     """
-    n = len(positions)
-    if n < 2:
+    if not positions:
         return []
-    
-    flats = []
-    seg_start = 0
-    # Tolerance: positions within 0.1 are considered "same"
-    for i in range(1, n):
-        if abs(positions[i] - positions[seg_start]) > 0.1:
-            # End of this flat candidate
-            duration = times[i - 1] - times[seg_start]
-            if duration >= min_flat_duration_ms and i - seg_start >= 2:
-                flats.append({
-                    'start_idx': seg_start,
-                    'end_idx': i - 1,
-                    'periodic': False,
-                    'period': None,
-                    'motif': None,
-                    'is_flat': True
-                })
-            seg_start = i
-    
-    # Check trailing flat
-    if seg_start < n - 1:
-        duration = times[-1] - times[seg_start]
-        if duration >= min_flat_duration_ms and n - seg_start >= 2:
-            flats.append({
-                'start_idx': seg_start,
-                'end_idx': n - 1,
-                'periodic': False,
-                'period': None,
-                'motif': None,
-                'is_flat': True
+    states = []
+    cur_val = positions[0]
+    start_idx = 0
+    for i in range(1, len(positions)):
+        if abs(positions[i] - cur_val) > 0.001:
+            states.append({
+                'value': cur_val,
+                'start_idx': start_idx,
+                'end_idx': i - 1,
+                'start_time': times[start_idx]
             })
-    
-    return flats
+            cur_val = positions[i]
+            start_idx = i
+    states.append({
+        'value': cur_val,
+        'start_idx': start_idx,
+        'end_idx': len(positions) - 1,
+        'start_time': times[start_idx]
+    })
+    return states
 
 
 # =========================================================================
-#  STEP 2 — AUTOCORRELATION & PERIOD DETECTION
-# =========================================================================
-
-def autocorrelation(series: List[float]) -> List[float]:
-    n = len(series)
-    if n < 2:
-        return [1.0]
-    mean = sum(series) / n
-    centered = [x - mean for x in series]
-    denom = sum(c * c for c in centered)
-    if denom == 0:
-        return [1.0] + [0.0] * (n - 1)
-    r = []
-    for lag in range(n):
-        num = sum(centered[i] * centered[i + lag] for i in range(n - lag))
-        r.append(num / denom)
-    return r
-
-
-def find_all_strong_peaks(acf: List[float], min_lag: int, max_lag: int,
-                          threshold: float = None) -> List[int]:
-    if threshold is None:
-        threshold = ACF_PEAK_THRESHOLD
-    max_lag = min(max_lag, len(acf) - 1)
-    peaks = []
-    for lag in range(min_lag, max_lag + 1):
-        if acf[lag] >= threshold:
-            left_ok = (lag == min_lag or acf[lag] >= acf[lag - 1])
-            right_ok = (lag == max_lag or acf[lag] >= acf[lag + 1])
-            if left_ok and right_ok:
-                peaks.append((lag, acf[lag]))
-    peaks.sort(key=lambda x: -x[1])
-    return [p[0] for p in peaks]
-
-
-# =========================================================================
-#  MOTIF EXTRACTION
-# =========================================================================
-
-def minimal_period(p_seq: List[float]) -> int:
-    L = len(p_seq)
-    for k in range(1, L):
-        if L % k != 0:
-            continue
-        ok = True
-        for i in range(L):
-            if abs(p_seq[i] - p_seq[i % k]) > 0.5:
-                ok = False
-                break
-        if ok:
-            return k
-    return L
-
-
-def extract_motif_at(times: List[int], positions: List[float],
-                     start_idx: int, period: int) -> Tuple[List[int], List[float]]:
-    end_idx = min(start_idx + period, len(positions))
-    t0 = times[start_idx]
-    rel_t = [times[i] - t0 for i in range(start_idx, end_idx)]
-    p_seq = [positions[i] for i in range(start_idx, end_idx)]
-    return rel_t, p_seq
-
-
-def trim_flat_ends(p_seq: List[float], t_rel: List[int]) -> Tuple[List[float], List[int]]:
-    if len(p_seq) <= 2:
-        return p_seq, t_rel
-    start = 0
-    while start < len(p_seq) - 1 and abs(p_seq[start] - p_seq[start + 1]) < 0.001:
-        start += 1
-    end = len(p_seq)
-    while end > start + 1 and abs(p_seq[end - 1] - p_seq[end - 2]) < 0.001:
-        end -= 1
-    if start > 0 or end < len(p_seq):
-        p_seq = p_seq[start:end]
-        t_rel = [t - t_rel[start] for t in t_rel[start:end]]
-    return p_seq, t_rel
-
-
-def motif_similarity(m1: Optional[Tuple], m2: Optional[Tuple],
-                     corr_threshold: float = 0.85) -> bool:
-    if m1 is None or m2 is None:
-        return False
-    _, p1 = m1
-    _, p2 = m2
-    if len(p1) != len(p2):
-        return False
-    mu1 = sum(p1) / len(p1)
-    mu2 = sum(p2) / len(p2)
-    num = sum((a - mu1) * (b - mu2) for a, b in zip(p1, p2))
-    den = (sum((a - mu1) ** 2 for a in p1) * sum((b - mu2) ** 2 for b in p2)) ** 0.5
-    if den == 0:
-        return True
-    return num / den >= corr_threshold
-
-
-# =========================================================================
-#  STEP 3 — GLOBAL SEGMENTATION
+#  STEP 2 — PATTERN DISCOVERY & SEGMENTATION
 # =========================================================================
 
 def segment_script(times: List[int], positions: List[float]) -> List[dict]:
+    """
+    RLE-based pattern discovery segmentation.
+    
+    1. Compress the position sequence via RLE.
+    2. Find repeating patterns in the compressed state sequence.
+    3. Map detected patterns back to the original point indices.
+    4. Constant (non-repeating) segments become irregular blocks.
+    
+    Returns list of dicts: {start_idx, end_idx, periodic, period, motif}
+    """
     n = len(positions)
-    if n < MIN_PERIOD_POINTS + 1:
+    if n < 2:
         return [{'start_idx': 0, 'end_idx': n - 1, 'periodic': False,
                  'period': None, 'motif': None}]
 
-    # ---- 3a. Pre-identify flat segments ----
-    flat_segs = extract_flat_segments(times, positions)
-    flat_idx_set = set()
-    for fs in flat_segs:
-        for k in range(fs['start_idx'], fs['end_idx'] + 1):
-            flat_idx_set.add(k)
-
+    # ---- 2a. RLE compress ----
+    states = rle_encode(times, positions)
+    n_states = len(states)
+    state_values = [s['value'] for s in states]
+    
     if DEBUG:
-        for fs in flat_segs:
-            print(f"  [FLAT] idx [{fs['start_idx']}-{fs['end_idx']}] "
-                  f"time {times[fs['start_idx']]}-{times[fs['end_idx']]} ms, "
-                  f"pos={positions[fs['start_idx']]:.1f}")
+        print(f"  [RLE] {n} points → {n_states} states")
 
-    # ---- 3b. Sliding-window ACF voting (skip flat indices) ----
-    vote_periodic = [0.0] * n
-    vote_period = [None] * n
-
-    for start in range(0, n - MIN_PERIOD_POINTS, ACF_STEP):
-        end = min(start + ACF_WINDOW_POINTS, n)
-        window_pos = positions[start:end]
-        if len(window_pos) < MIN_PERIOD_POINTS + 1:
-            continue
-
-        acf = autocorrelation(window_pos)
-        peaks = find_all_strong_peaks(
-            acf, MIN_PERIOD_POINTS,
-            min(MAX_PERIOD_POINTS, len(window_pos) // 2)
-        )
-
-        a = start + (end - start) // 4
-        b = end - (end - start) // 4
-        for i in range(a, b):
-            if i in flat_idx_set:
-                continue  # never override flat detection
-            if peaks:
-                vote_periodic[i] += 1.0
-                vote_period[i] = peaks[0]
-            else:
-                vote_periodic[i] -= 0.6
-
-    # ---- 3c. Fill unlabelled indices ----
-    for i in range(n):
-        if i in flat_idx_set:
-            vote_periodic[i] = -1.0
-            vote_period[i] = None
-            continue
-        if vote_periodic[i] == 0.0:
-            for d in range(1, n):
-                if i - d >= 0 and vote_periodic[i - d] != 0.0 and (i - d) not in flat_idx_set:
-                    vote_periodic[i] = vote_periodic[i - d]
-                    vote_period[i] = vote_period[i - d]
-                    break
-                if i + d < n and vote_periodic[i + d] != 0.0 and (i + d) not in flat_idx_set:
-                    vote_periodic[i] = vote_periodic[i + d]
-                    vote_period[i] = vote_period[i + d]
-                    break
-            else:
-                vote_periodic[i] = -1.0
-
-    # ---- 3d. Binarise & build raw blocks ----
-    label = [1 if v > 0 else 0 for v in vote_periodic]
-    # Flat segments are always irregular
-    for i in flat_idx_set:
-        label[i] = 0
-
-    raw_blocks = []
+    # ---- 2b. Find repeating patterns ----
+    max_L = min(MAX_PATTERN_LENGTH, n_states // 2)
+    raw_segments = []  # (start_state_idx, end_state_idx, pattern_tuple, repeat_count)
     i = 0
-    while i < n:
-        state = label[i]
-        per = vote_period[i] if state == 1 else None
-        j = i
-        while j < n and label[j] == state and (state == 0 or vote_period[j] == per):
-            j += 1
-        raw_blocks.append({
-            'start_idx': i,
-            'end_idx': j - 1,
-            'periodic': state == 1,
-            'period': per,
-            'motif': None
-        })
-        i = j
 
-    # ---- 3e. Split large periodic blocks by motif consistency ----
-    # ACF sees period=4 across 900 points, but within that span the
-    # pattern changes every ~16-20 points.  We slide a verification
-    # window and split wherever the local pattern diverges from the
-    # block's extracted motif.
-    raw_blocks = split_by_motif_consistency(raw_blocks, times, positions)
+    while i < n_states:
+        best_repeat = 0
+        best_L = 0
+        best_pattern = None
 
-    # ---- 3f. Extract motif for each periodic block ----
-    for blk in raw_blocks:
-        if not blk['periodic'] or blk['period'] is None:
-            continue
-        period = blk['period']
-        idx0 = blk['start_idx']
-        idx1 = blk['end_idx']
-        block_len = idx1 - idx0 + 1
+        for L in range(2, max_L + 1):
+            if i + L > n_states:
+                break
+            pattern = tuple(state_values[i:i + L])
+            repeat = 1
+            pos = i + L
+            while pos + L <= n_states and tuple(state_values[pos:pos + L]) == pattern:
+                repeat += 1
+                pos += L
+            # Choose longest total span (repeat * L); tie-break by shorter L
+            if repeat >= 2:
+                if repeat * L > best_repeat * best_L or \
+                   (repeat * L == best_repeat * best_L and L < best_L):
+                    best_repeat = repeat
+                    best_L = L
+                    best_pattern = pattern
 
-        if block_len < period:
-            blk['periodic'] = False
-            blk['period'] = None
-            continue
-
-        best_motif = None
-        best_score = -1.0
-        max_offset = min(period * 2, max(1, block_len - period))
-        for offset in range(max_offset):
-            cand_rel_t, cand_p = extract_motif_at(times, positions, idx0 + offset, period)
-            mp = minimal_period(cand_p)
-            if mp < len(cand_p):
-                cand_p = cand_p[:mp]
-                cand_rel_t = cand_rel_t[:mp]
-            cand_p, cand_rel_t = trim_flat_ends(cand_p, cand_rel_t)
-            if len(cand_p) < 2:
-                continue
-            score = 0.5
-            if idx0 + offset + period < idx1:
-                next_p = positions[idx0 + offset + period:
-                                   min(idx0 + offset + 2 * period, idx1 + 1)]
-                if len(next_p) >= len(cand_p):
-                    next_p = next_p[:len(cand_p)]
-                    mu1 = sum(cand_p) / len(cand_p)
-                    mu2 = sum(next_p) / len(next_p)
-                    num = sum((a - mu1) * (b - mu2) for a, b in zip(cand_p, next_p))
-                    den = (sum((a - mu1) ** 2 for a in cand_p) *
-                           sum((b - mu2) ** 2 for b in next_p)) ** 0.5
-                    score = num / den if den > 0 else 1.0
-            if abs(cand_p[0] - positions[idx0]) < 0.5:
-                score += 0.1
-            if score > best_score:
-                best_score = score
-                best_motif = (cand_rel_t, cand_p)
-
-        if best_motif is not None and len(best_motif[1]) >= 2:
-            blk['motif'] = best_motif
-            blk['period'] = len(best_motif[1])
+        if best_pattern is not None:
+            end_state_idx = i + best_L * best_repeat - 1
+            raw_segments.append((i, end_state_idx, best_pattern, best_repeat))
+            i = end_state_idx + 1
         else:
-            blk['periodic'] = False
-            blk['period'] = None
+            # Single constant state
+            raw_segments.append((i, i, None, 0))
+            i += 1
 
-    # ---- 3g. Merge adjacent periodic blocks with similar motifs ----
+    # ---- 2c. Map to original point indices ----
+    segments = []
+    for seg in raw_segments:
+        start_s, end_s, pattern, repeats = seg
+        
+        start_idx = states[start_s]['start_idx']
+        end_idx = states[end_s]['end_idx']
+        
+        if pattern is not None and repeats >= 2:
+            # Periodic block: extract motif from the first pattern instance
+            # Find the original points corresponding to one full pattern
+            pattern_start_s = start_s
+            pattern_end_s = start_s + len(pattern) - 1
+            motif_start_idx = states[pattern_start_s]['start_idx']
+            motif_end_idx = states[pattern_end_s]['end_idx']
+            
+            # Extract actual positions for the motif from original data
+            motif_p = positions[motif_start_idx: motif_end_idx + 1]
+            motif_t_rel = [times[k] - times[motif_start_idx]
+                           for k in range(motif_start_idx, motif_end_idx + 1)]
+            
+            # Remove trailing duplicate (RLE boundaries may overlap)
+            # Keep the first point of each value group
+            deduped_p = [motif_p[0]]
+            deduped_t = [motif_t_rel[0]]
+            for k in range(1, len(motif_p)):
+                if abs(motif_p[k] - deduped_p[-1]) > 0.001:
+                    deduped_p.append(motif_p[k])
+                    deduped_t.append(motif_t_rel[k])
+            
+            if len(deduped_p) >= 2:
+                segments.append({
+                    'start_idx': start_idx,
+                    'end_idx': end_idx,
+                    'periodic': True,
+                    'period': len(deduped_p),
+                    'motif': (deduped_t, deduped_p),
+                })
+            else:
+                # Degenerate — treat as irregular
+                segments.append({
+                    'start_idx': start_idx, 'end_idx': end_idx,
+                    'periodic': False, 'period': None, 'motif': None,
+                })
+        else:
+            # Irregular / constant block
+            # Check if it's a long flat segment (preserve verbatim)
+            duration = times[end_idx] - times[start_idx]
+            is_flat = duration >= 2000 and \
+                      all(abs(positions[k] - positions[start_idx]) < 0.01
+                          for k in range(start_idx, end_idx + 1))
+            segments.append({
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'periodic': False,
+                'period': None,
+                'motif': None,
+                'is_flat': is_flat if is_flat else None,
+            })
+
+    # ---- 2d. Merge adjacent irregular blocks ----
     merged = []
-    for blk in raw_blocks:
+    for seg in segments:
         if not merged:
-            merged.append(blk)
+            merged.append(seg)
             continue
         prev = merged[-1]
-        if (prev['periodic'] and blk['periodic'] and
-                prev['period'] == blk['period'] and
-                motif_similarity(prev.get('motif'), blk.get('motif'))):
-            prev['end_idx'] = blk['end_idx']
-        elif (not prev['periodic'] and not blk['periodic']):
-            prev['end_idx'] = blk['end_idx']
+        if not prev['periodic'] and not seg['periodic']:
+            prev['end_idx'] = seg['end_idx']
+            # Carry forward flat flag
+            if seg.get('is_flat') and not prev.get('is_flat'):
+                prev['is_flat'] = True
         else:
-            merged.append(blk)
+            merged.append(seg)
 
-    # ---- 3h. Merge tiny irregular blocks into neighbours ----
-    MIN_BLOCK_POINTS = 3
+    # ---- 2e. Absorb tiny irregular blocks into neighbours ----
+    MIN_IRREG_PTS = 3
     refined = []
-    for blk in merged:
+    for seg in merged:
         if not refined:
-            refined.append(blk)
+            refined.append(seg)
             continue
         prev = refined[-1]
-        curr_len = blk['end_idx'] - blk['start_idx'] + 1
+        curr_len = seg['end_idx'] - seg['start_idx'] + 1
         prev_len = prev['end_idx'] - prev['start_idx'] + 1
-        if not blk['periodic'] and curr_len < MIN_BLOCK_POINTS:
-            prev['end_idx'] = blk['end_idx']
-        elif not prev['periodic'] and prev_len < MIN_BLOCK_POINTS and len(refined) >= 2:
-            refined[-2]['end_idx'] = blk['end_idx']
+        
+        # Absorb tiny irregular block into previous
+        if not seg['periodic'] and curr_len < MIN_IRREG_PTS and not seg.get('is_flat'):
+            prev['end_idx'] = seg['end_idx']
+        # Absorb previous tiny irregular into current
+        elif not prev['periodic'] and prev_len < MIN_IRREG_PTS and not prev.get('is_flat') \
+             and len(refined) >= 2:
+            refined[-2]['end_idx'] = seg['end_idx']
             refined.pop()
-            refined.append(blk)
+            refined.append(seg)
         else:
-            refined.append(blk)
+            refined.append(seg)
 
     if DEBUG:
         print("\n[DEBUG] ====== SEGMENTATION RESULT ======")
-        for idx, blk in enumerate(refined):
-            st, en = blk['start_idx'], blk['end_idx']
+        for idx, seg in enumerate(refined):
+            st, en = seg['start_idx'], seg['end_idx']
             t0, t1 = times[st], times[en]
             dur = t1 - t0
             pts = en - st + 1
-            if blk['periodic']:
-                mt, mp = blk['motif'] if blk['motif'] else ([], [])
+            if seg['periodic']:
+                mt, mp = seg['motif'] if seg['motif'] else ([], [])
                 print(f"  Block {idx}: idx [{st}-{en}]  time {t0}-{t1} ms "
-                      f"({dur} ms, {pts} pts)  PERIODIC  period={blk['period']} pts")
+                      f"({dur} ms, {pts} pts)  PERIODIC  period={seg['period']} pts")
                 print(f"           Motif positions : {mp}")
             else:
+                flat_tag = " FLAT" if seg.get('is_flat') else ""
                 print(f"  Block {idx}: idx [{st}-{en}]  time {t0}-{t1} ms "
-                      f"({dur} ms, {pts} pts)  IRREGULAR")
+                      f"({dur} ms, {pts} pts)  IRREGULAR{flat_tag}")
         print("[DEBUG] ==================================\n")
 
     return refined
 
 
 # =========================================================================
-#  STEP 3e — MOTIF-CONSISTENCY SPLITTING
-# =========================================================================
-
-def split_by_motif_consistency(blocks: List[dict],
-                               times: List[int],
-                               positions: List[float]) -> List[dict]:
-    """
-    For large periodic blocks where ACF detected the same period but the
-    actual shape changes, split at points where the delta fingerprint
-    (differences between consecutive positions within a window) diverges.
-
-    Delta fingerprinting is far more sensitive to pattern changes than
-    position-based MSE comparisons, especially for long-period motifs.
-    """
-
-    def _fingerprint(win: List[float]) -> Tuple[float, ...]:
-        """Return the delta sequence of a window."""
-        return tuple(round(win[i + 1] - win[i], 2) for i in range(len(win) - 1))
-
-    def _fingerprint_dist(fp1: Tuple, fp2: Tuple) -> float:
-        """Euclidean distance between two fingerprints, normalised."""
-        if len(fp1) != len(fp2):
-            return float('inf')
-        ssq = sum((a - b) ** 2 for a, b in zip(fp1, fp2))
-        return (ssq / len(fp1)) ** 0.5  # RMS distance of deltas
-
-    result = []
-    for blk in blocks:
-        if not blk['periodic'] or blk['period'] is None:
-            result.append(blk)
-            continue
-
-        period = blk['period']
-        idx0 = blk['start_idx']
-        idx1 = blk['end_idx']
-        block_len = idx1 - idx0 + 1
-
-        # Only split blocks with ≥ 6 periods
-        if block_len < period * 6:
-            result.append(blk)
-            continue
-
-        # ---- Reference fingerprint from first period ----
-        ref_win = positions[idx0: idx0 + period]
-        ref_fp = _fingerprint(ref_win)
-
-        # Threshold: RMS delta distance > 15 means patterns differ
-        FP_THRESH = 12.0
-
-        split_positions = [idx0]
-
-        for cursor in range(idx0 + period, idx1 - period + 1, period):
-            win = positions[cursor: cursor + period]
-            fp = _fingerprint(win)
-            dist = _fingerprint_dist(ref_fp, fp)
-
-            if dist > FP_THRESH:
-                split_positions.append(cursor)
-                ref_fp = fp  # new reference
-
-        split_positions.append(idx1 + 1)
-
-        if len(split_positions) <= 2:
-            result.append(blk)
-            continue
-
-        if DEBUG:
-            print(f"  [SPLIT] Block [{idx0}-{idx1}] ({block_len} pts, "
-                  f"period={period}) → {len(split_positions) - 2} splits")
-
-        for k in range(len(split_positions) - 1):
-            s = split_positions[k]
-            e = split_positions[k + 1] - 1
-            if e - s + 1 < period:
-                if result and not result[-1]['periodic']:
-                    result[-1]['end_idx'] = e
-                else:
-                    result.append({
-                        'start_idx': s, 'end_idx': e,
-                        'periodic': False, 'period': None, 'motif': None
-                    })
-                continue
-            result.append({
-                'start_idx': s, 'end_idx': e,
-                'periodic': True,
-                'period': period,
-                'motif': None
-            })
-
-    return result
-
-
-# =========================================================================
-#  STEP 4 — PERIODIC BLOCK PROCESSING
+#  STEP 3 — PERIODIC BLOCK PROCESSING (whole-motif deletion + stretch)
 # =========================================================================
 
 def build_repetition_sequence(motif_p: List[float], K: int) -> List[float]:
@@ -528,10 +299,10 @@ def compute_sequence_min_time(seq: List[float]) -> float:
     return total
 
 
-def process_periodic_block(blk: dict, times: List[int],
+def process_periodic_block(seg: dict, times: List[int],
                            positions: List[float]) -> List[dict]:
-    idx0 = blk['start_idx']
-    idx1 = blk['end_idx']
+    idx0 = seg['start_idx']
+    idx1 = seg['end_idx']
     t_start = times[idx0]
     t_end = times[idx1]
     block_duration = t_end - t_start
@@ -542,10 +313,10 @@ def process_periodic_block(blk: dict, times: List[int],
     pos_start = positions[idx0]
     pos_end = positions[idx1]
 
-    if blk['motif'] is None:
+    if seg['motif'] is None:
         return fallback_amplitude_limiter(times, positions, idx0, idx1)
 
-    motif_t_rel, motif_p = blk['motif']
+    motif_t_rel, motif_p = seg['motif']
     M = len(motif_p)
 
     if M < 2:
@@ -581,13 +352,11 @@ def process_periodic_block(blk: dict, times: List[int],
         else:
             body = [pos_start]
 
-        # Force pos_start prefix
         if abs(body[0] - pos_start) > 0.5:
             trial = [pos_start] + body
         else:
             trial = list(body)
 
-        # Correction to pos_end if needed
         needs_correction = abs(trial[-1] - pos_end) > 0.5
         if needs_correction:
             trial_with_correction = trial + [pos_end]
@@ -652,7 +421,8 @@ def process_periodic_block(blk: dict, times: List[int],
     # ---- Convert to actions ----
     actions = []
     for t_val, p_val in zip(out_times, out_positions):
-        actions.append({'at': int(round(t_val)), 'pos': round(p_val, 6)})
+        # Use ceil for safety margin on integer ms conversion
+        actions.append({'at': int(math.ceil(t_val)), 'pos': round(p_val, 6)})
 
     for i in range(1, len(actions)):
         if actions[i]['at'] <= actions[i - 1]['at']:
@@ -677,7 +447,7 @@ def process_periodic_block(blk: dict, times: List[int],
 
 
 # =========================================================================
-#  STEP 5 — IRREGULAR BLOCK PROCESSING
+#  STEP 4 — IRREGULAR BLOCK PROCESSING
 # =========================================================================
 
 def fallback_amplitude_limiter(times: List[int], positions: List[float],
@@ -713,13 +483,13 @@ def fallback_amplitude_limiter(times: List[int], positions: List[float],
     return out
 
 
-def process_irregular_block(blk: dict, times: List[int],
+def process_irregular_block(seg: dict, times: List[int],
                             positions: List[float]) -> List[dict]:
-    idx0 = blk['start_idx']
-    idx1 = blk['end_idx']
+    idx0 = seg['start_idx']
+    idx1 = seg['end_idx']
 
-    # If flat segment: preserve original points exactly (no processing)
-    if blk.get('is_flat'):
+    # Flat segment: preserve original points verbatim
+    if seg.get('is_flat'):
         if DEBUG:
             orig_pts = idx1 - idx0 + 1
             print(f"  [Irregular/Flat] Block [{idx0}-{idx1}] "
@@ -728,7 +498,7 @@ def process_irregular_block(blk: dict, times: List[int],
         return [{'at': times[i], 'pos': positions[i]}
                 for i in range(idx0, idx1 + 1)]
 
-    # Quick check: all same position → keep as-is
+    # All same position → keep start and end
     all_same = all(abs(positions[i] - positions[idx0]) < 0.01
                    for i in range(idx0, idx1 + 1))
     if all_same:
@@ -739,7 +509,7 @@ def process_irregular_block(blk: dict, times: List[int],
 
 
 # =========================================================================
-#  STEP 6 — POST-PROCESSING & MERGE
+#  STEP 5 — POST-PROCESSING & MERGE
 # =========================================================================
 
 def merge_blocks(block_results: List[List[dict]]) -> List[dict]:
@@ -757,7 +527,8 @@ def merge_blocks(block_results: List[List[dict]]) -> List[dict]:
     return merged
 
 
-def fix_rounding_overspeed(actions: List[dict]) -> List[dict]:
+def enforce_speed_limit(actions: List[dict]) -> List[dict]:
+    """Ensure every segment respects MAX_SPEED by stretching timestamps."""
     if len(actions) < 2:
         return actions
     actions = sorted(actions, key=lambda a: a['at'])
@@ -793,7 +564,7 @@ def final_cleanup(actions: List[dict], orig_times: List[int],
         else:
             deduped[-1]['pos'] = a['pos']
 
-    # Lock first and last to original EXACT values
+    # Pin first and last to original values
     if orig_times:
         deduped[0]['at'] = orig_times[0]
         deduped[0]['pos'] = orig_positions[0]
@@ -833,7 +604,7 @@ def limit_speed(input_path: str, output_path: str):
     print(f"[*] {n_total} points, total duration {total_duration_ms} ms "
           f"({total_duration_ms / 1000:.1f} s)")
 
-    # Quick pre-check
+    # ---- Pre-check ----
     max_orig_speed = 0.0
     overspeed_count = 0
     for i in range(n_total - 1):
@@ -847,7 +618,8 @@ def limit_speed(input_path: str, output_path: str):
     print(f"[*] Original max speed: {max_orig_speed:.1f}  "
           f"(limit={MAX_SPEED})  overspeed segments: {overspeed_count}/{n_total - 1}")
 
-    print("[*] Running ACF-based segmentation ...")
+    # ---- Segmentation ----
+    print("[*] Running RLE-based pattern segmentation ...")
     blocks = segment_script(times, pos)
 
     n_periodic = sum(1 for b in blocks if b['periodic'])
@@ -857,6 +629,7 @@ def limit_speed(input_path: str, output_path: str):
     print(f"[*] {len(blocks)} blocks: {n_periodic} periodic ({periodic_pts} pts), "
           f"{n_irreg} irregular ({irreg_pts} pts)")
 
+    # ---- Process blocks ----
     block_results = []
     for blk in blocks:
         if blk['periodic']:
@@ -865,10 +638,12 @@ def limit_speed(input_path: str, output_path: str):
             res = process_irregular_block(blk, times, pos)
         block_results.append(res)
 
+    # ---- Merge, enforce speed, cleanup ----
     all_actions = merge_blocks(block_results)
-    all_actions = fix_rounding_overspeed(all_actions)
+    all_actions = enforce_speed_limit(all_actions)
     cleaned = final_cleanup(all_actions, times, pos)
 
+    # ---- Validation ----
     if DEBUG:
         print(f"\n[DEBUG] ====== OUTPUT VALIDATION ======")
         platform_count = 0

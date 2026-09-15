@@ -1,31 +1,62 @@
-## Introduce
-**Smart Speed Limiter** is a lightweight Python script that automatically detects and corrects overspeed issues in JSON‑formatted action sequences. It keeps the movement speed between any two consecutive actions within a safe threshold of **600 units/second** by intelligently redistributing time or compressing amplitudes, while preserving the overall shape and rhythm of the original trajectory as much as possible.
+# Funscript Speed Limiter v3.2
 
-> *Written by DeepSeek.*
+## Overview
+A speed limiter for funscripts that preserves amplitude, rhythm, and total duration. Instead of reducing stroke amplitude, it detects periodic blocks, reduces repetition count, and stretches the remaining cycles to fill the original block duration. Non-periodic overspeed gaps are re-timed, followed by a global speed correction pass.
 
 ## Usage
-(Python 3.6+ required. If you're new to Python, just Google it or ask an AI.)
+`python limit_speed_deepseek.py <input.funscript> <output.funscript>`
 
-```bash
-python limit_speed_deepseek.py <input.json> <output.json>
-```
+## Key Features
+- Preserves position amplitude whenever possible.
+- Preserves rhythm and total script duration.
+- Detects periodic blocks with period sizes `P=2..30`.
+- Reduces repeat count `K` and stretches cycles to lower speed.
+- Handles short non-periodic overspeed gaps up to `MAX_GAP_PTS`.
+- Applies global overspeed correction only above `MAX_SPEED + SPEED_TOL`.
+- Iterates global correction up to `MAX_ITER` times.
+- Cleans timestamps, removes duplicates, and enforces strictly increasing time.
+- Restores original first/last timestamps and positions.
+- Provides optional debug validation for outliers and overspeed segments.
 
-### Key Features
-- **Automatic overspeed detection** – calculates instantaneous speed from timestamps (`at`) and positions (`pos`), and accurately flags all overspeed adjacent pairs.
-- **Differentiates isolated vs. continuous overspeed blocks**
-  - **Isolated (≤2 actions)** : applies a “mid‑point compression” strategy – directly reduces the displacement to the legal limit while keeping timestamps unchanged.
-  - **Continuous (≥3 actions)** : uses a “time‑stretching + key‑point removal” approach – proportionally allocates the minimum required time across segments, and if the total minimum time exceeds the available duration, iteratively deletes intermediate points with the greatest time‑saving benefit.
-- **Ultimate safety sweep** – after all processing, a final global check re‑examines every adjacent pair and forcibly compresses any remaining overspeed boundary, guaranteeing 100% compliance.
+## How It Works
+1. **Load and preprocess**  
+   Sort actions by `at` and `pos`, drop near-duplicate points, and normalize same-timestamp conflicts.
 
-### How It Works
-1. **Speed marking** – iterate over all adjacent pairs, compute `speed = |Δpos| / (Δat/1000)`, mark pairs where speed > 600.
-2. **Grouping** – group consecutive marked indices into blocks, classify as isolated (length ≤2) or continuous (length ≥3).
-3. **Isolated processing** – directly compress the displacement between the two actions to exactly hit 600 units/s.
-4. **Continuous processing** –
-   - Compute the minimum required time for each segment (based on 600 speed).
-   - If total minimum time > actual duration, iteratively remove the intermediate point that yields the largest reduction in total minimum time.
-   - Stretch the remaining segments proportionally, round timestamps (with ceiling and boundary protection) to ensure strictly increasing times while keeping endpoints fixed.
-5. **Final sweep** – re‑scan all adjacent pairs and force‑compress any remaining overspeed.
+2. **Detect periodic blocks**  
+   Scan for repeated cycles where positions match within `POS_TOL` and relative timing matches within `TIME_RATIO_TOL`. Extend each match to count total repeats `K`. `P=2` requires more repeats to avoid false positives.
+
+3. **Limit periodic blocks**  
+   For each detected block, try reducing `K` to `K_new`. Rescale the first `K_new` cycles uniformly into the original block duration `T_block`. This lowers speed without changing stroke amplitude. If even one cycle cannot fit, keep the original block.
+
+4. **Handle non-periodic gaps**  
+   For uncovered overspeed segments with at most `MAX_GAP_PTS` points, compute minimum required time per segment using `MAX_SPEED`, then distribute remaining slack proportionally to original segment durations.
+
+5. **Global speed correction**  
+   After merging all segments, correct only speeds above `MAX_SPEED + SPEED_TOL`. Push later timestamps forward as needed, then rescale total duration back to the original duration. Repeat up to `MAX_ITER` times.
+
+6. **Final cleanup and output**  
+   Sort, deduplicate, enforce increasing timestamps, restore original first/last points, and write compact JSON.
+
+## Parameters
+| Parameter | Default | Purpose |
+|---|---:|---|
+| `MAX_SPEED` | `600` | Maximum speed in `pos/s` |
+| `SPEED_TOL` | `10` | Global fix tolerance; only correct speeds above `MAX_SPEED + SPEED_TOL` |
+| `TIME_RATIO_TOL` | `0.15` | Relative timing tolerance for period matching |
+| `MIN_PERIOD_SEGS` | `2` | Minimum period segment count |
+| `MAX_PERIOD_SEGS` | `30` | Maximum period segment count |
+| `MIN_REPEATS` | `3` | Minimum repeats for normal periods |
+| `MIN_REPEATS_P2` | `5` | Minimum repeats for `P=2` periods |
+| `POS_TOL` | `0.5` | Position tolerance for period matching |
+| `MAX_GAP_PTS` | `15` | Maximum gap size eligible for re-timing |
+| `MAX_ITER` | `8` | Maximum global correction iterations |
+| `DEBUG` | `False` | Enable verbose validation output |
+
+## Notes
+- The script cannot create time. If the original duration is insufficient, some overspeed may remain.
+- Speeds up to `MAX_SPEED + SPEED_TOL` are treated as acceptable to avoid unnecessary micro-adjustments.
+- Best suited for regular repetitive scripts, but designed to safely handle irregular segments.
+- Output preserves the original first/last timestamps and positions.
 
 ## Comparison of Results
 
@@ -37,9 +68,3 @@ python limit_speed_deepseek.py <input.json> <output.json>
 
 **Compare**
 <img width="1102" height="371" alt="compare" src="https://github.com/user-attachments/assets/457b773d-aa4d-46a0-9b2e-cf9f035628d5" />
-
-**Random situation**
-It appears that many adjustments have been made, but effectively, some points are discarded and the remaining ones are limited in range. This constitutes a mixed strategy. 
-<img width="1113" height="376" alt="random" src="https://github.com/user-attachments/assets/e0cc316a-f391-4630-aaaf-850b6d7b097c" />
-
-*The difference might be hard to see from some images, but in reality, for continuous overspeed blocks, the actual effect includes time redistribution and key‑point optimization, resulting in a better‑paced sequence overall.*
